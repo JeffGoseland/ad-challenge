@@ -1,0 +1,655 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# #### Instructions
+
+# Please submit your solution via email in .txt format (code and results) and a .jpg/.png/etc. picture of your model formulation (can be handwritten, typed etc). Please label each file appropriately and make sure they are easily identified. Ensure readability and reproducibility; code should be well commented and easy to execute. You will use the dataset provided in the accompanying email. This challenge should take no more than 3 hours. Please focus on understanding/exploring the data as well as answering the client prompts below.
+
+# #### Challenge Description
+
+# Our client produces four types of cars: electric, compact, intermediate and luxury and two types of heavy vehicles, trucks and vans. Manufacturing limits total production capacity to at most 1,300,000 vehicles per year. Electrics and compacts are built together in a facility with a total annual capacity of 680,000 cars. Intermediate and luxury cars are produced in another facility with capacity of 430,000; and the heavy vehicle facility has a capacity of 315,000. Our client's marketing strategy requires that electrics and compacts must constitute at least half of the product mix for the four car types. Profit margins and market potential are summarized as follows:
+# 
+# ![model](table.jpg)
+
+# #### Questions of Interest / Objective
+# According to government regulation, the average fleet fuel efficiency must be at least 30 MPG. Our client would like to use an optimization model to understand the implications of government and corporate policies on its production plans.
+# Using the cars dataset:
+# 
+# - What is the heaviest vehicle?
+# - What is the car with the highest fuel efficiency?
+# - Determine the average fuel efficiency of each type of vehicle
+# - Formulate a linear program to determine the maximum profit that can be achieved by our client.
+# - Solve the LP using a program of your choice.
+# - What is the maximum profit that can be obtained? How many and what percentage of total production will electric cars produced under this plan?
+# 
+# Optional Bonus Question:
+# - Unfortunately, due to supply chain and labor constraints, our client has a new requirement. Either luxury cars or trucks can be produced, but not both. Implement this requirement in the model.
+# - What is the new maximum profit that can be obtained? Of luxury cars and trucks, which type of vehicle will be produced?
+# 
+
+# #### Imports
+
+# In[1]:
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from plotnine import *
+from scipy.optimize import linprog
+
+import warnings
+
+seed = 1980
+
+
+# ##### Get Data
+
+# In[72]:
+
+
+# skip the second row -- data types
+carsopt_df= pd.read_csv('./data/carsopt.txt', sep=';', skiprows=[1])  
+
+# simplify col names
+carsopt_df.columns = carsopt_df.columns.str.replace(" ", "_").str.lower()
+
+carsopt_df.head()
+
+
+# In[24]:
+
+
+carsopt_df.dtypes
+
+
+# In[73]:
+
+
+pd.concat([carsopt_df.describe(),
+           carsopt_df.median(numeric_only=True).rename("median").to_frame().T,
+          ])
+
+
+# In[78]:
+
+
+# lets look at it by vehicle type
+carsopt_df.groupby('vehicle')[['mpg','cylinders','displacement','horsepower','weight','acceleration']].agg(['mean','median','min','max']).round(2)
+
+
+# **Notes:** 
+# Someone really had fun making sure there were misspellings in vehicle, we'll fix these then look at the others
+
+# In[32]:
+
+
+len(carsopt_df["model"].unique())
+
+
+# In[ ]:
+
+
+carsopt_df['model'].unique()
+
+
+# In[37]:
+
+
+len(carsopt_df['origin'].unique())
+
+
+# In[38]:
+
+
+(carsopt_df['origin'].unique())
+
+
+# In[39]:
+
+
+len(carsopt_df['vehicle'].unique())
+
+
+# In[40]:
+
+
+(carsopt_df['vehicle'].unique())
+
+
+# In[18]:
+
+
+carsopt_df.isnull().sum()
+
+
+# In[47]:
+
+
+print((carsopt_df[carsopt_df.select_dtypes(include='number').columns] == 0).sum())
+
+
+# **High Level Notes on Data:**
+# 
+# - 5 continuous variables
+# - 3 categorical variables 
+# - cylinders could be categorical depending on distribution (or can just be treated this way)
+# - Looking at the mean/medians most of the data is slightly skewed to the left or probably normally distributed
+# - There are only nulls iin the vehicle column, we'll look to see if they should be imputed or ust dropped. Since the vehicle type deteremines the margin we can only assign a type if the median values for types are very different and this aligns with one well
+# 
+# **Fixes:**
+# - Fix spelling errors with vehicle
+# - Look at nulls in vehicle
+# - Look at zeros in cylinders, horsepower and mgp and potentially impute
+
+# #### Data Cleansing
+
+# In[123]:
+
+
+# Fix spelling in vehicle (
+_vehicle_spelling = {
+    "Elektric": "Electric",
+    "Electirc": "Electric",
+    "Compcat": "Compact",
+    "Lux": "Luxury",
+}
+
+carsopt_clean = carsopt_df.copy()
+carsopt_clean["vehicle"] = carsopt_df["vehicle"].replace(_vehicle_spelling)
+
+(carsopt_clean['vehicle'].unique())
+
+
+# In[124]:
+
+
+# should look much better now
+carsopt_clean.groupby('vehicle')[['mpg','cylinders','displacement','horsepower','weight','acceleration']].agg(['mean','median','min','max']).round(2)
+
+
+# In[79]:
+
+
+# Look at nulls in vehicle
+null_vehicle = carsopt_df[carsopt_df['vehicle'].isnull()]
+null_vehicle
+
+
+# In[96]:
+
+
+# For rows with null vehicle: list models and check whether that model always
+# carries a single `vehicle` value in non-missing rows (imputable from duplicates).
+null_vehicle = carsopt_df[carsopt_df["vehicle"].isnull()]
+
+models = null_vehicle["model"].unique()
+rows = []
+for m in models:
+    sub = carsopt_df[carsopt_df["model"] == m]
+    non_null = sub["vehicle"].dropna()
+    rows.append(
+        {
+            "model": m,
+            "n_rows_for_model": len(sub),
+            "n_non_null_vehicle": len(non_null),
+            "non_null_vehicles": sorted(non_null.unique().tolist()),
+            "at_most_one_vehicle_type": non_null.nunique() <= 1,
+        }
+    )
+vehicle_by_model = pd.DataFrame(rows).sort_values("model")
+vehicle_by_model
+
+
+# In[97]:
+
+
+# we can impute these values from the non-null vehicle types
+# this is a little heavy handed but maybe we'll need this down the line 
+# Get the vehicle type from non-null rows with the same model prefix
+prefix_map = (carsopt_clean.dropna(subset=['vehicle'])
+              .assign(prefix=lambda x: x['model'].str.extract(r'^([A-Za-z]+)')[0])
+              .groupby('prefix')['vehicle'].first())
+
+carsopt_clean['prefix'] = carsopt_clean['model'].str.extract(r'^([A-Za-z]+)')
+carsopt_clean['vehicle'] = carsopt_clean.apply(
+    lambda row: prefix_map.get(row['prefix'], row['vehicle']) if pd.isnull(row['vehicle']) else row['vehicle'],
+    axis=1)
+carsopt_clean.drop(columns='prefix', inplace=True)
+
+carsopt_clean[carsopt_clean['vehicle'].isnull()]
+
+
+# In[99]:
+
+
+# Look at zeros in cylinders, horsepower and mgp and potentially impute
+print((carsopt_df[carsopt_df.select_dtypes(include='number').columns] == 0).sum())
+
+
+# In[98]:
+
+
+carsopt_df[carsopt_df['mpg'] == 0]
+
+
+# In[64]:
+
+
+carsopt_df[carsopt_df['cylinders'] == 0]
+
+
+# In[100]:
+
+
+# let see if all electrics have 0 cylinders
+carsopt_clean[carsopt_clean['vehicle'] == 'Electric']['cylinders'].value_counts()
+
+
+# In[101]:
+
+
+carsopt_df[carsopt_df['horsepower'] == 0]
+
+
+# In[102]:
+
+
+# check to see if imputation is possible
+for col in ['mpg', 'cylinders', 'horsepower']:
+    zero_models = carsopt_df[carsopt_df[col] == 0]['model'].str.extract(r'^([A-Za-z]+-?\d+)')[0].unique()
+    for m in zero_models:
+        subset = carsopt_df[carsopt_df['model'].str.startswith(m)]
+        non_zero = subset[subset[col] != 0][col]
+        is_consistent = non_zero.nunique() == 1
+        print(f"{col} | {m} | consistent: {is_consistent} | unique_vals: {non_zero.nunique()} | "
+              f"mean: {non_zero.mean():.2f} | median: {non_zero.median():.2f} | std: {non_zero.std():.2f} | "
+              f"values: {sorted(non_zero.unique())} | zero_count: {(subset[col]==0).sum()}")
+
+
+# In[103]:
+
+
+# we'll impute the mg and the horsepower, cylinders we will not that makes sense for electric 
+for col in ['mpg', 'horsepower']:
+    zero_models = carsopt_clean[carsopt_clean[col] == 0]['model'].str.extract(r'^([A-Za-z]+-?\d+)')[0].unique()
+    for m in zero_models:
+        non_zero = carsopt_clean[(carsopt_clean['model'].str.startswith(m)) & (carsopt_clean[col] != 0)][col]
+        fill_val = non_zero.median()
+        carsopt_clean.loc[(carsopt_clean['model'].str.startswith(m)) & (carsopt_clean[col] == 0), col] = fill_val
+
+
+# In[104]:
+
+
+# Look at zeros in cylinders, horsepower and mgp and potentially impute
+print((carsopt_clean[carsopt_clean.select_dtypes(include='number').columns] == 0).sum())
+
+
+# **Notes:**
+# 
+
+# #### EDA
+
+# Distributions of Data
+
+# In[105]:
+
+
+mean = carsopt_clean['mpg'].mean()
+median = carsopt_clean['mpg'].median()
+
+(ggplot(carsopt_clean, aes(x='mpg')) + 
+        geom_histogram(bins = 20, 
+                       fill = 'lightblue', 
+                       color = 'darkblue',
+                       alpha = 0.7) +
+        labs(title = 'MPG Distribution', x = 'mpg', y = 'Count') + 
+        geom_vline(xintercept=mean, color='red', linetype='dashed') +
+        geom_vline(xintercept=median, color='green', linetype='dashed'))
+
+
+# In[126]:
+
+
+# let's take a look at the outliers
+carsopt_clean[carsopt_clean['mpg'] > 1000]
+
+
+# In[127]:
+
+
+#impute the median mpg for the L-150 model
+l150_median = carsopt_clean[(carsopt_clean['model'].str.startswith('L-')) & (carsopt_clean['mpg'] < 1000)]['mpg'].median()
+carsopt_clean.loc[(carsopt_clean['model'] == 'L-150') & (carsopt_clean['mpg'] > 1000), 'mpg'] = l150_median
+
+
+# In[129]:
+
+
+mean = carsopt_clean['mpg'].mean()
+median = carsopt_clean['mpg'].median()
+
+(ggplot(carsopt_clean, aes(x='mpg')) + 
+        geom_histogram(bins = 20, 
+                       fill = 'lightblue', 
+                       color = 'darkblue',
+                       alpha = 0.7) +
+        labs(title = 'MPG Distribution', x = 'mpg', y = 'Count') + 
+        geom_vline(xintercept=mean, color='red', linetype='dashed') +
+        geom_vline(xintercept=median, color='green', linetype='dashed'))
+
+
+# In[130]:
+
+
+# let's take a look at the outliers
+carsopt_clean[carsopt_clean['mpg'] > 399]
+
+
+# In[132]:
+
+
+#impute the median mpg for the t100 model
+t100_median = carsopt_clean[(carsopt_clean['model'].str.startswith('T-100')) & (carsopt_clean['mpg'] < 400)]['mpg'].median()
+carsopt_clean.loc[(carsopt_clean['model'] == 'T-100z') & (carsopt_clean['mpg'] > 399), 'mpg'] = t100_median
+
+
+# In[134]:
+
+
+mean = carsopt_clean['mpg'].mean()
+median = carsopt_clean['mpg'].median()
+
+(ggplot(carsopt_clean, aes(x='mpg')) + 
+        geom_histogram(bins = 20, 
+                       fill = 'lightblue', 
+                       color = 'darkblue',
+                       alpha = 0.7) +
+        labs(title = 'MPG Distribution', x = 'mpg', y = 'Count') + 
+        geom_vline(xintercept=mean, color='red', linetype='dashed') +
+        geom_vline(xintercept=median, color='green', linetype='dashed'))
+
+
+# In[133]:
+
+
+mean = carsopt_clean['cylinders'].mean()
+median = carsopt_clean['cylinders'].median()
+
+(ggplot(carsopt_clean, aes(x='cylinders')) + 
+        geom_histogram(bins = 20, 
+                       fill = 'lightblue', 
+                       color = 'darkblue',
+                       alpha = 0.7) +
+        labs(title = 'cylinders Distribution', x = 'cylinders', y = 'Count') + 
+        geom_vline(xintercept=mean, color='red', linetype='dashed') +
+        geom_vline(xintercept=median, color='green', linetype='dashed'))
+
+
+# In[108]:
+
+
+mean = carsopt_clean['displacement'].mean()
+median = carsopt_clean['displacement'].median()
+
+(ggplot(carsopt_clean, aes(x='displacement')) + 
+        geom_histogram(bins = 20, 
+                       fill = 'lightblue', 
+                       color = 'darkblue',
+                       alpha = 0.7) +
+        labs(title = 'displacement Distribution', x = 'displacement', y = 'Count') + 
+        geom_vline(xintercept=mean, color='red', linetype='dashed') +
+        geom_vline(xintercept=median, color='green', linetype='dashed'))
+
+
+# In[109]:
+
+
+mean = carsopt_clean['weight'].mean()
+median = carsopt_clean['weight'].median()
+
+(ggplot(carsopt_clean, aes(x='weight')) + 
+        geom_histogram(bins = 20, 
+                       fill = 'lightblue', 
+                       color = 'darkblue',
+                       alpha = 0.7) +
+        labs(title = 'weight Distribution', x = 'weight', y = 'Count') + 
+        geom_vline(xintercept=mean, color='red', linetype='dashed') +
+        geom_vline(xintercept=median, color='green', linetype='dashed'))
+
+
+# In[111]:
+
+
+mean = carsopt_clean['acceleration'].mean()
+median = carsopt_clean['acceleration'].median()
+
+(ggplot(carsopt_clean, aes(x='acceleration')) + 
+        geom_histogram(bins = 20, 
+                       fill = 'lightblue', 
+                       color = 'darkblue',
+                       alpha = 0.7) +
+        labs(title = 'acceleration Distribution', x = 'acceleration', y = 'Count') + 
+        geom_vline(xintercept=mean, color='red', linetype='dashed') +
+        geom_vline(xintercept=median, color='green', linetype='dashed'))
+
+
+# In[117]:
+
+
+(ggplot(carsopt_clean, aes(x='origin'))
+ + geom_bar(fill='lightblue', color='darkblue', alpha=0.7)
+ + labs(title='Origin Distribution', x='Origin', y='Count'))
+
+
+# In[119]:
+
+
+(ggplot(carsopt_clean, aes(x='model'))
+ + geom_bar(fill='lightblue', color='darkblue', alpha=0.7)
+ + labs(title='model Distribution', x='model', y='Count'))
+
+
+# In[135]:
+
+
+# let's find that model and see what's up with it
+carsopt_clean['model'].value_counts()[carsopt_clean['model'].value_counts() > 1]
+
+
+# In[136]:
+
+
+carsopt_clean[carsopt_clean['model'] == 'L-150']
+
+
+# **Notes** Looks good, just variation
+
+# In[120]:
+
+
+(ggplot(carsopt_clean, aes(x='vehicle'))
+ + geom_bar(fill='lightblue', color='darkblue', alpha=0.7)
+ + labs(title='vehicle Distribution', x='vehicle', y='Count'))
+
+
+# **Notes:**
+# The data is cleansed, let's answer some car questions!!!
+
+# ##### What is the heaviest vehicle?
+
+# In[138]:
+
+
+carsopt_clean.loc[carsopt_clean['weight'].idxmax(), ['model', 'vehicle', 'weight']]
+
+
+# ##### What is the car with the highest fuel efficiency?
+
+# In[139]:
+
+
+carsopt_clean.loc[carsopt_clean['mpg'].idxmax(), ['model', 'vehicle', 'mpg']]
+
+
+# ##### Determine the average fuel efficiency of each type of vehicle
+
+# In[141]:
+
+
+mpg_order = carsopt_clean.groupby('vehicle')['mpg'].mean().sort_values().index.tolist()
+
+(ggplot(carsopt_clean, aes(x='vehicle', y='mpg'))
+ + geom_boxplot(fill='lightblue', color='darkblue', alpha=0.7)
+ + scale_x_discrete(limits=mpg_order)
+ + labs(title='Average Fuel Efficiency by Vehicle Type', x='Vehicle Type', y='MPG'))
+
+
+# In[143]:
+
+
+print(carsopt_clean.groupby('vehicle')['mpg'].mean().round(2))
+
+
+# #### Linear Programming Approach
+# 
+# **Vehicle Manufacturing Decision Variables:**
+# - c1 = Electric cars
+# - c2 = Compact cars
+# - c3 = Intermediate cars
+# - c4 = Luxury cars 
+# - c5 = Trucks 
+# - c6 = Vans 
+# 
+# **Objective Function (Maximize Profit):**
+# max Z = 150c1 + 225c2 + 250c3 + 500c4 + 400c5 + 200c6
+# 
+# **Constraints:**
+# 1. Total capacity: c1+c2+c3+c4+c5+c6 <= 1,300,000
+# 2. Electric/Compact facility: c1+c2 <= 680,000
+# 3. Intermediate/Luxury facility: c3+c4 <= 430,000
+# 4. Heavy vehicle facility: c5+c6 <= 315,000
+# 5. Marketing (electric+compact >= 50% of car mix): c1+c2 >= 0.5*(c1+c2+c3+c4)  (equivalently c1+c2 >= c3+c4)
+# 6. Market limits: c1<=600,000, c2<=400,000, c3<=300,000, c4<=225,000, c5<=225,000, c6<=100,000
+# 7. Fuel Efficiency: (mpg_e*c1 + mpg_c*c2 + mpg_i*c3 + mpg_l*c4 + mpg_t*c5 + mpg_v*c6) / (c1+c2+c3+c4+c5+c6) >= 30
+# 8. Non-negativity: all ci >= 0
+
+# In[ ]:
+
+
+# get average MPG by vehicle type from dataset
+vehicle_order = ['Electric', 'Compact', 'Intermediate', 'Luxury', 'Truck', 'Van']
+mpg_avg = carsopt_clean.groupby('vehicle')['mpg'].mean()
+mpg = [mpg_avg[v] for v in vehicle_order]
+
+# profit per vehicle (negated for scipy minimization)
+# it's negative because we're maximizing profit, LP can only minimize so we'll minimize negated profit
+obj = [-150, -225, -250, -500, -400, -200]
+
+# constraint matrix - shows where the constraints are turned off and on
+    # c1: Total manufacturing capacity cannot exceed 1.3M vehicles/year
+    # c2: Electric/Compact share a facility capped at 680K/year
+    # c3: Intermediate/Luxury share a facility capped at 430K/year
+    # c4: Heavy vehicle facility (Truck/Van) capped at 315K/year
+    # c5: Marketing — c1+c2 >= 0.5*(c1+c2+c3+c4)  <=>  c1+c2 >= c3+c4  <=>  -c1-c2+c3+c4 <= 0
+    # c6: Fleet fuel efficiency >= 30 MPG (government regulation)
+        # Linearized: sum((mpg_i - 30) * ci) >= 0, negated for <= form
+A_ub = [[1, 1, 1, 1, 1, 1],
+        [1, 1, 0, 0, 0, 0],
+        [0, 0, 1, 1, 0, 0],
+        [0, 0, 0, 0, 1, 1],
+        [-1, -1, 1, 1, 0, 0],
+        [-(m-30) for m in mpg]]
+
+# constraint values corresponding to each matrix constraint above
+b_ub = [1_300_000, 680_000, 430_000, 315_000, 0, 0]
+
+# Variable bounds: (0, max_market_demand) per vehicle type
+bounds = [(0, 600_000),  # Electric
+          (0, 400_000),  # Compact
+          (0, 300_000),  # Intermediate
+          (0, 225_000),  # Luxury
+          (0, 225_000),  # Truck
+          (0, 100_000),  # Van
+          ]
+
+# solve using HiGHS LP solver via scipy
+result = linprog(obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+
+
+# #### LP Results
+# We can now answer the questions below, along with seeing the production plan: 
+# 
+# -What is the maximum profit that can be obtained? 
+# -How many and what percentage of total production will electric cars produced under this plan?
+
+# In[162]:
+
+
+print(f"Status: {result.message}")
+print(f"Max Profit: ${-result.fun:,.0f}")
+print(f"\nProduction Plan:")
+for label, val in zip(vehicle_order, result.x):
+    print(f"  {label}: {val:,.0f}")
+print(f"\nTotal: {sum(result.x):,.0f}")
+print(f"Electric %: {result.x[0]/sum(result.x)*100:.1f}%")
+
+
+# In[163]:
+
+
+# validate all constraints are satisfied
+c1, c2, c3, c4, c5, c6 = result.x
+total = sum(result.x)
+fleet_mpg = sum(m * v for m, v in zip(mpg, result.x)) / total
+
+validations = {
+    'Total capacity <= 1,300,000':        (total, total <= 1_300_000),
+    'E/C facility <= 680,000':            (c1+c2, c1+c2 <= 680_000),
+    'I/L facility <= 430,000':            (c3+c4, c3+c4 <= 430_000),
+    'Heavy facility <= 315,000':          (c5+c6, c5+c6 <= 315_000),
+    'E+C >= 50% of car mix':              (c1+c2, c1+c2 >= 0.5*(c1+c2+c3+c4)),
+    'Electric <= 600,000':                (c1, c1 <= 600_000),
+    'Compact <= 400,000':                 (c2, c2 <= 400_000),
+    'Intermediate <= 300,000':            (c3, c3 <= 300_000),
+    'Luxury <= 225,000':                  (c4, c4 <= 225_000),
+    'Truck <= 225,000':                   (c5, c5 <= 225_000),
+    'Van <= 100,000':                     (c6, c6 <= 100_000),
+    'Fleet MPG >= 30':                    (fleet_mpg, fleet_mpg >= 30),
+}
+
+print(f"{'Constraint':<35} {'Value':>15} {'Pass':>6}")
+print("-------------------------------------------------")
+for constraint, (value, passed) in validations.items():
+    print(f"{constraint:<35} {value:>15,.1f} {'PASS' if passed else 'FAIL':>6}")
+
+
+# #### Extra Credit   
+# - Unfortunately, due to supply chain and labor constraints, our client has a new requirement. Either luxury cars or trucks can be produced, but not both. Implement this requirement in the model.
+# - What is the new maximum profit that can be obtained? Of luxury cars and trucks, which type of vehicle will be produced?
+# 
+# **Approach**
+# This can be done with MILP or with LP setting a constraint for no luxury in one run and no trucks in the other.  This is simpler, less code so we'll do it this way. 
+
+# In[164]:
+
+
+# scenario 1: no luxury (c4=0), trucks allowed
+bounds_no_luxury = [(0, 600_000), (0, 400_000), (0, 300_000), (0, 0), (0, 225_000), (0, 100_000)]
+res_no_luxury = linprog(obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_no_luxury, method='highs')
+
+
+# scenario 2: no trucks (c5=0), luxury allowed
+bounds_no_trucks = [(0, 600_000), (0, 400_000), (0, 300_000), (0, 225_000), (0, 0), (0, 100_000)]
+res_no_trucks = linprog(obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_no_trucks, method='highs')
+
+for label, res in [('no luxury (trucks)', res_no_luxury), ('no trucks (luxury)', res_no_trucks)]:
+    print(f'--- {label} ---')
+    print(f'max profit: ${-res.fun:,.0f}')
+    for v, val in zip(vehicle_order, res.x):
+        print(f'  {v}: {val:,.0f}')
+    print()
+
+
+# Produce Luxury Cars in lieu of trucks with the additional constraint. The additional profit with that plan is  $750,000
